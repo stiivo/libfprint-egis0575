@@ -51,6 +51,7 @@ drivers_tests = {
     'goodixmoc': {},
     'nb1010': {},
     'egis0570': {},
+    'egis0575': {},
     'egismoc': {},
     'egis_etu905': {},
     'egismoc-05a1': {},
