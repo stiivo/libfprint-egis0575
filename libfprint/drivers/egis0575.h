@@ -45,8 +45,9 @@
 #define EGIS0575_RESIZE 1
 
 /* MIN SD not the standard deviation anymore, other algorithm produced better distinction for me. without finger 25 to 125, with finger 100 to 300*/
-#define EGIS0575_MIN_SD 125
-#define EGIS0575_MAX_SD 525
+#define EGIS0575_MIN_SD 100
+#define EGIS0575_MAX_SD 1000
+
 #define EGIS0575_TIMEOUT 10000
 
 // with 10 frames it takes a really long swipe to get an image
@@ -75,7 +76,7 @@ typedef struct Packet
   int            response_length;
 } Packet;
 
-static const Packet EGIS0575_GET_CALIBRATION_BYTES_PACKETS[] = {
+static const Packet EGIS0575_GET_CALIBRATION_BYTES_PACKETS_PHASE_1[] = {
   {.length = 6, .sequence = (unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x60, 0x00}, .response_length = 7},
   {.length = 6, .sequence = (unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x60, 0x01}, .response_length = 7},
   {.length = 7, .sequence = (unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x61, 0x0a, 0xfd}, .response_length = 7},
@@ -92,12 +93,20 @@ static const Packet EGIS0575_GET_CALIBRATION_BYTES_PACKETS[] = {
   {.length = 6, .sequence = (unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x60, 0x40}, .response_length = 7},
   {.length = 18, .sequence = (unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x63, 0x09, 0x0b, 0x83, 0x24, 0x00, 0x44, 0x0f, 0x08, 0x20, 0x20, 0x00, 0x00, 0x52}, .response_length = 18},
   {.length = 9, .sequence = (unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x63, 0x2c, 0x02, 0x00, 0x15}, .response_length = 9},
-  {.length = 6, .sequence = (unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x60, 0x2d}, .response_length = 7},
-  {.length = 6, .sequence = (unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x60, 0x2d}, .response_length = 7},
+};
+
+//send this till response is 0x05 
+static const Packet EGIS0575_GET_CALIBRATION_BYTES_PACKETS_PHASE_2 = {.length = 6, .sequence = (unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x60, 0x2d}, .response_length = 7};
+
+static const Packet EGIS0575_GET_CALIBRATION_BYTES_PACKETS_PHASE_3[] = {
   {.length = 7, .sequence = (unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x62, 0x67, 0x03}, .response_length = 10},
   {.length = 10, .sequence = (unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x63, 0x33, 0x03, 0x73, 0x10, 0x01}, .response_length = 10},
-  {.length = 6, .sequence = (unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x60, 0x35}, .response_length = 7},
-  {.length = 6, .sequence = (unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x60, 0x35}, .response_length = 7},
+};
+
+ //send this till resonse is 0x00
+static const Packet EGIS0575_GET_CALIBRATION_BYTES_PACKETS_PHASE_4 = {.length = 6, .sequence = (unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x60, 0x35}, .response_length = 7};
+
+static const Packet EGIS0575_GET_CALIBRATION_BYTES_PACKETS_PHASE_5[] = {
   {.length = 7, .sequence = (unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x61, 0x0a, 0xf4}, .response_length = 7},
   {.length = 7, .sequence = (unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x61, 0x0c, 0x44}, .response_length = 7},
   {.length = 7, .sequence = (unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x61, 0x50, 0x01}, .response_length = 7},

@@ -64,9 +64,16 @@ enum packet_ssm_states {
 // Runs at the start, if calibration pkg is in storage, this loads it to the calibration_sequence. if not it gets it from sensor and stores it.
 enum setup_ssm_states {
   SSM_SETUP_START,
-  SSM_PRE_CALIBRATION_BYTES,
+  SSM_PRE_CALIBRATION_BYTES_PHASE_1,
+  SSM_PRE_CALIBRATION_BYTES_PHASE_2_REQ,
+  SSM_PRE_CALIBRATION_BYTES_PHASE_2_RESP,
+  SSM_PRE_CALIBRATION_BYTES_PHASE_3,
+  SSM_PRE_CALIBRATION_BYTES_PHASE_4_REQ,
+  SSM_PRE_CALIBRATION_BYTES_PHASE_4_RESP,
+  SSM_PRE_CALIBRATION_BYTES_PHASE_5,
   SSM_GET_CALIBRATION_BYTES_REQ,
   SSM_GET_CALIBRATION_BYTES_RESP,
+  SSM_CHECK_CALIBRATION_BYTES,
   SSM_SETUP_DONE
 };
 
@@ -210,7 +217,45 @@ process_imgs (FpiSsm *ssm, FpDevice *dev)
 /*
  * ==================== IO ====================
  */
+static void
+resp_setup (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
+{
+  // error handling
+  if(error)
+    {
+      fp_dbg ("Error occurred in setup");
+      fpi_ssm_mark_failed (transfer->ssm, error);
 
+      return;
+    }
+
+  // response handling
+  switch(fpi_ssm_get_cur_state (transfer->ssm))
+    {
+    case SSM_PRE_CALIBRATION_BYTES_PHASE_2_RESP:
+      if(transfer->buffer[5] != 0x05)  // Wait till value is 0x05
+        fpi_ssm_jump_to_state (transfer->ssm, SSM_PRE_CALIBRATION_BYTES_PHASE_2_REQ);
+      else
+        fpi_ssm_next_state (transfer->ssm);
+      break;
+
+    case SSM_PRE_CALIBRATION_BYTES_PHASE_4_RESP:
+      if(transfer->buffer[5] != 0x00) // Wait till value is 0x00
+        fpi_ssm_jump_to_state (transfer->ssm, SSM_PRE_CALIBRATION_BYTES_PHASE_4_REQ);
+      else
+        fpi_ssm_next_state (transfer->ssm);
+      break;
+
+    default:
+      fp_dbg ("This should never occure, this code should be called if ssm not in state 2 or 4 resp");
+      fpi_ssm_mark_failed (transfer->ssm, g_error_new_literal (G_IO_ERROR, G_IO_ERROR_CANCELLED, "Fatal Error in Setup, wrong ssm state"));
+      break;
+    }
+
+
+
+
+}
 static void
 resp_init (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
 {
@@ -261,6 +306,7 @@ resp_image (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError 
     }
 
   // check if finger is presen in the frame
+
   if(!finger_present (transfer))
     {
       self->img_without_finger_in_row += 1;
@@ -268,20 +314,22 @@ resp_image (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError 
       if(self->img_without_finger_in_row > EGIS0575_MAX_CAPTURES_WITHOUT_FINGER_IN_ROW)
         {
           fp_dbg ("To many images without Finger.");
-          fpi_image_device_report_finger_status (img_self, FALSE);
+          if(self->img_without_finger_in_row == EGIS0575_MAX_CAPTURES_WITHOUT_FINGER_IN_ROW + 1) // dont spam that
+            fpi_image_device_report_finger_status (img_self, FALSE);
           g_slist_free_full (self->strips, g_free);
           self->strips_len = 0;
           self->strips = NULL;
           fpi_ssm_jump_to_state (transfer->ssm, IMG_SSM_POST_REPEAT); // end imges in row and wait till finger is on sensor again
           return;
         }
-      fpi_image_device_report_finger_status (img_self, TRUE);
 
       fpi_ssm_jump_to_state (transfer->ssm, IMG_SSM_PRE_REPEAT_IMAGE);
       return;
     }
   else
     {
+      if(self->strips_len == 0) // dont spam that
+        fpi_image_device_report_finger_status (img_self, TRUE);
       // save frame to Buffer
       // process_frame_linear taken from clan.c driver, to make the job of stiching img together easier for libfprint
       process_frame_linear (transfer->buffer, &self->strips);
@@ -359,14 +407,21 @@ setup_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
 {
   FpDeviceEgis0575 *self = FPI_DEVICE_EGIS0575 (dev);
   FpiUsbTransfer *transfer;
+  FpiSsm *child_ssm;
 
   switch(fpi_ssm_get_cur_state (ssm))
     {
     case SSM_SETUP_START:
-      if (self->calibration_sequence)
-        fpi_ssm_mark_completed (ssm);
 
       self->calibration_sequence = g_malloc (sizeof (unsigned char) * EGIS0575_IMGSIZE);
+
+      fpi_ssm_next_state (ssm);
+
+      /*
+         if (egis0575_load_calibration(self))
+         fpi_ssm_mark_completed (ssm);
+         else
+         fpi_ssm_next_state (ssm);*/
 
       /* this is pseudo code for the case we get harddisk storage of the bytes
          if(packet already stored){
@@ -374,14 +429,75 @@ setup_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
          jump to done;
          }
        */
-      fpi_ssm_next_state (ssm);
+
       break;
 
-    case SSM_PRE_CALIBRATION_BYTES:
-      FpiSsm *child_ssm;
+    case SSM_PRE_CALIBRATION_BYTES_PHASE_1:
 
-      self->pkt_array = EGIS0575_GET_CALIBRATION_BYTES_PACKETS;
-      self->pkt_array_len = G_N_ELEMENTS (EGIS0575_GET_CALIBRATION_BYTES_PACKETS);
+      self->pkt_array = EGIS0575_GET_CALIBRATION_BYTES_PACKETS_PHASE_1;
+      self->pkt_array_len = G_N_ELEMENTS (EGIS0575_GET_CALIBRATION_BYTES_PACKETS_PHASE_1);
+      self->current_index = 0;
+      child_ssm = fpi_ssm_new (FP_DEVICE (dev), packet_ssm_run_state, PACKET_SSM_DONE);
+      fpi_ssm_start_subsm (ssm, child_ssm);
+      break;
+
+    case SSM_PRE_CALIBRATION_BYTES_PHASE_2_REQ:
+      transfer = fpi_usb_transfer_new (dev);
+
+      fpi_usb_transfer_fill_bulk_full (transfer, EGIS0575_EPOUT, EGIS0575_GET_CALIBRATION_BYTES_PACKETS_PHASE_2.sequence, EGIS0575_GET_CALIBRATION_BYTES_PACKETS_PHASE_2.length, NULL);
+
+      transfer->ssm = ssm;
+      transfer->short_is_error = TRUE;
+
+      fpi_usb_transfer_submit (transfer, EGIS0575_TIMEOUT, NULL, fpi_ssm_usb_transfer_cb, NULL);
+      break;
+
+    case SSM_PRE_CALIBRATION_BYTES_PHASE_2_RESP:
+      transfer = fpi_usb_transfer_new (dev);
+
+      fpi_usb_transfer_fill_bulk (transfer, EGIS0575_EPIN, EGIS0575_GET_CALIBRATION_BYTES_PACKETS_PHASE_2.response_length);
+
+      transfer->ssm = ssm;
+      transfer->short_is_error = TRUE;
+
+      fpi_usb_transfer_submit (transfer, EGIS0575_TIMEOUT, NULL, resp_setup, NULL);
+      break;
+
+    case SSM_PRE_CALIBRATION_BYTES_PHASE_3:
+
+      self->pkt_array = EGIS0575_GET_CALIBRATION_BYTES_PACKETS_PHASE_3;
+      self->pkt_array_len = G_N_ELEMENTS (EGIS0575_GET_CALIBRATION_BYTES_PACKETS_PHASE_3);
+      self->current_index = 0;
+      child_ssm = fpi_ssm_new (FP_DEVICE (dev), packet_ssm_run_state, PACKET_SSM_DONE);
+      fpi_ssm_start_subsm (ssm, child_ssm);
+      break;
+
+    case SSM_PRE_CALIBRATION_BYTES_PHASE_4_REQ:
+      transfer = fpi_usb_transfer_new (dev);
+
+      fpi_usb_transfer_fill_bulk_full (transfer, EGIS0575_EPOUT, EGIS0575_GET_CALIBRATION_BYTES_PACKETS_PHASE_4.sequence, EGIS0575_GET_CALIBRATION_BYTES_PACKETS_PHASE_4.length, NULL);
+
+      transfer->ssm = ssm;
+      transfer->short_is_error = TRUE;
+
+      fpi_usb_transfer_submit (transfer, EGIS0575_TIMEOUT, NULL, fpi_ssm_usb_transfer_cb, NULL);
+      break;
+
+    case SSM_PRE_CALIBRATION_BYTES_PHASE_4_RESP:
+      transfer = fpi_usb_transfer_new (dev);
+
+      fpi_usb_transfer_fill_bulk (transfer, EGIS0575_EPIN, EGIS0575_GET_CALIBRATION_BYTES_PACKETS_PHASE_4.response_length);
+
+      transfer->ssm = ssm;
+      transfer->short_is_error = TRUE;
+
+      fpi_usb_transfer_submit (transfer, EGIS0575_TIMEOUT, NULL, resp_setup, NULL);
+      break;
+
+    case SSM_PRE_CALIBRATION_BYTES_PHASE_5:
+
+      self->pkt_array = EGIS0575_GET_CALIBRATION_BYTES_PACKETS_PHASE_5;
+      self->pkt_array_len = G_N_ELEMENTS (EGIS0575_GET_CALIBRATION_BYTES_PACKETS_PHASE_5);
       self->current_index = 0;
       child_ssm = fpi_ssm_new (FP_DEVICE (dev), packet_ssm_run_state, PACKET_SSM_DONE);
       fpi_ssm_start_subsm (ssm, child_ssm);
@@ -396,7 +512,6 @@ setup_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
       transfer->short_is_error = TRUE;
 
       fpi_usb_transfer_submit (transfer, EGIS0575_TIMEOUT, NULL, fpi_ssm_usb_transfer_cb, NULL);
-
       break;
 
     case SSM_GET_CALIBRATION_BYTES_RESP:
@@ -408,7 +523,39 @@ setup_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
       transfer->short_is_error = TRUE;
 
       fpi_usb_transfer_submit (transfer, EGIS0575_TIMEOUT, NULL, fpi_ssm_usb_transfer_cb, NULL);
+      break;
 
+    case SSM_CHECK_CALIBRATION_BYTES:
+      /* Because we get the calibration_sequence every time there are cases that it is broken.
+         In that case the last (I think up to ~300) bytes are the same. I my testing it is 0x3f or in ascii '?'.
+         If the calibration_sequence ends on at least 100 (arbitrary amount) of the same byte, we discard it and
+         ask the user to retry in some time. (this should be fixed when storage is implemented)
+
+         It is caused because i was to lazy making a loop that waits for a specific resopnse, see egis0575.h EGIS0575_GET_CALIBRATION_BYTES_PACKETS
+       */
+
+      unsigned char last_byte = self->calibration_sequence[EGIS0575_IMGSIZE - 1];
+      gboolean cal_broken = TRUE;
+
+      for(int i = EGIS0575_IMGSIZE - 2; i > EGIS0575_IMGSIZE - 100; i--)
+        {
+          if(self->calibration_sequence[i] != last_byte)
+            {
+              cal_broken = FALSE;
+              break;
+            }
+        }
+
+      if(cal_broken)
+        {
+          fp_dbg ("Setup calibration package is broken, please retry");
+          g_clear_pointer (&self->calibration_sequence, g_free);
+
+          fpi_ssm_mark_failed (ssm, g_error_new_literal (G_IO_ERROR, G_IO_ERROR_CANCELLED, "Setup calibration package broken, retry later"));
+          return;
+        }
+
+      fpi_ssm_mark_completed (ssm);
       break;
     }
 }
@@ -530,6 +677,7 @@ img_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
           fpi_image_device_deactivate_complete (FP_IMAGE_DEVICE (dev), NULL);
           return;
         }
+
       transfer = fpi_usb_transfer_new (dev);
       fpi_usb_transfer_fill_bulk_full (transfer, EGIS0575_EPOUT, (unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x60, 0x01}, 6, NULL);
       transfer->ssm = ssm;
@@ -639,32 +787,6 @@ dev_setup_done (FpiSsm *ssm, FpDevice *dev, GError *error)
       g_clear_pointer (&self->calibration_sequence, g_free);
 
       fpi_image_device_open_complete (FP_IMAGE_DEVICE (dev), error);
-      return;
-    }
-
-  /* Because we get the calibration_sequence every time there are cases that it is broken.
-     In that case the last (I think up to ~300) bytes are the same. I my testing it is 0x3f or in ascii '?'.
-     If the calibration_sequence ends on at least 100 (arbitrary amount) of the same byte, we discard it and
-     ask the user to retry in some time. (this should be fixed when storage is implemented)
-   */
-
-  unsigned char last_byte = self->calibration_sequence[EGIS0575_IMGSIZE - 1];
-  gboolean cal_broken = TRUE;
-
-  for(int i = EGIS0575_IMGSIZE - 2; i > EGIS0575_IMGSIZE - 100; i--)
-    {
-      if(self->calibration_sequence[i] != last_byte)
-        {
-          cal_broken = FALSE;
-          break;
-        }
-    }
-  if(cal_broken)
-    {
-      fp_dbg ("Setup calibration package is broken, retry in some time.");
-      g_clear_pointer (&self->calibration_sequence, g_free);
-
-      fpi_image_device_open_complete (FP_IMAGE_DEVICE (dev), g_error_new_literal (G_IO_ERROR, G_IO_ERROR_CANCELLED, "Setup calibration package broken, retry later"));
       return;
     }
 
