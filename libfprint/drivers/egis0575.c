@@ -602,8 +602,17 @@ loop_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 
   self->running = FALSE;
 
-  if (error)
-    fpi_image_device_session_error (img_dev, error);
+  /* A pending stop has to be completed however the loop ended, otherwise
+   * the device would hang in the deactivating state forever */
+  if (self->stop)
+    {
+      g_clear_error (&error);
+      fpi_image_device_deactivate_complete (img_dev, NULL);
+    }
+  else if (error)
+    {
+      fpi_image_device_session_error (img_dev, error);
+    }
 }
 
 static void
@@ -885,9 +894,7 @@ img_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
     case IMG_SSM_FINGER_REQ:
       if(self->stop)
         {
-          fpi_ssm_mark_completed (ssm);
-          self->running = FALSE;
-          fpi_image_device_deactivate_complete (FP_IMAGE_DEVICE (dev), NULL);
+          fpi_ssm_mark_completed (ssm); // loop_complete finishes the deactivation
           return;
         }
 
@@ -970,6 +977,7 @@ img_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
     case IMG_SSM_FREE_DATA:
       g_slist_free_full (g_steal_pointer (&self->strips), g_free);
       self->strips_len = 0;
+      fpi_ssm_next_state (ssm); // leave the cleanup state, so loop_complete gets called
       break;
 
     default:
