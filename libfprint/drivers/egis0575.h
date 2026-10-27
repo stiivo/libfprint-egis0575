@@ -64,6 +64,9 @@
 #define EGIS0575_CALIBRATION_RETRIES 20
 #define EGIS0575_CALIBRATION_RETRY_DELAY 300
 
+// how often a status register is polled in setup before giving up
+#define EGIS0575_MAX_POLLS 200
+
 /*
  * Image polling sequences
  *
