@@ -130,7 +130,7 @@ drivers_info = {
     'vfs0050': { 'endian_dependent': true },
     'etes603': {},
     'egis0570': {},
-    'egis0575': {},
+    'egis0575': { 'helper': ['pixman'] },
     'egismoc': {},
     'egis_etu905': {},
     'vcom5s': {},
