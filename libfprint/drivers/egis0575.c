@@ -47,6 +47,7 @@ struct _FpDeviceEgis0575
 
   unsigned char * calibration_sequence;
   int             calibration_retries;
+  int             polls;
 
   const Packet   *pkt_array;
   int             pkt_array_len;
@@ -67,6 +68,9 @@ enum packet_ssm_states {
 // Runs at the start, if calibration pkg is in storage, this loads it to the calibration_sequence. if not it gets it from sensor and stores it.
 enum setup_ssm_states {
   SSM_SETUP_START,
+  SSM_SETUP_SOFT_RESET,     // Reset the sensor first, a previous session may have left it in a state the calibration does not work in
+  SSM_SETUP_SOFT_RESET_REQ,
+  SSM_SETUP_SOFT_RESET_RESP,
   SSM_PRE_CALIBRATION_BYTES_PHASE_1,
   SSM_PRE_CALIBRATION_BYTES_PHASE_2_REQ,
   SSM_PRE_CALIBRATION_BYTES_PHASE_2_RESP,
@@ -428,20 +432,37 @@ resp_setup (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError 
     }
 
   // response handling
+  FpDeviceEgis0575 *self = FPI_DEVICE_EGIS0575 (dev);
+  gboolean done;
+
   switch(fpi_ssm_get_cur_state (transfer->ssm))
     {
+    case SSM_SETUP_SOFT_RESET_RESP:
     case SSM_PRE_CALIBRATION_BYTES_PHASE_2_RESP:
-      if(transfer->buffer[5] != 0x05)  // Wait till value is 0x05
-        fpi_ssm_jump_to_state (transfer->ssm, SSM_PRE_CALIBRATION_BYTES_PHASE_2_REQ);
-      else
-        fpi_ssm_next_state (transfer->ssm);
-      break;
-
     case SSM_PRE_CALIBRATION_BYTES_PHASE_4_RESP:
-      if(transfer->buffer[5] != 0x00) // Wait till value is 0x00
-        fpi_ssm_jump_to_state (transfer->ssm, SSM_PRE_CALIBRATION_BYTES_PHASE_4_REQ);
+      // Wait till the sensor reports the expected value, but not forever
+      if (fpi_ssm_get_cur_state (transfer->ssm) == SSM_SETUP_SOFT_RESET_RESP)
+        done = transfer->buffer[5] != 0x00;
+      else if (fpi_ssm_get_cur_state (transfer->ssm) == SSM_PRE_CALIBRATION_BYTES_PHASE_2_RESP)
+        done = transfer->buffer[5] == 0x05;
       else
-        fpi_ssm_next_state (transfer->ssm);
+        done = transfer->buffer[5] == 0x00;
+
+      if (done)
+        {
+          self->polls = 0;
+          fpi_ssm_next_state (transfer->ssm);
+        }
+      else if (++self->polls > EGIS0575_MAX_POLLS)
+        {
+          fp_dbg ("Sensor did not get ready in setup state %d", fpi_ssm_get_cur_state (transfer->ssm));
+          self->polls = 0;
+          fpi_ssm_jump_to_state (transfer->ssm, SSM_CHECK_CALIBRATION_BYTES);
+        }
+      else
+        {
+          fpi_ssm_jump_to_state (transfer->ssm, fpi_ssm_get_cur_state (transfer->ssm) - 1);
+        }
       break;
 
     default:
@@ -626,7 +647,8 @@ setup_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
     {
     case SSM_SETUP_START:
 
-      self->calibration_sequence = g_malloc (sizeof (unsigned char) * EGIS0575_IMGSIZE);
+      // zeroed, so a sensor that never got ready is detected as broken calibration
+      self->calibration_sequence = g_malloc0 (sizeof (unsigned char) * EGIS0575_IMGSIZE);
 
       fpi_ssm_next_state (ssm);
 
@@ -643,6 +665,36 @@ setup_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
          }
        */
 
+      break;
+
+    case SSM_SETUP_SOFT_RESET:
+      self->pkt_array = EGIS0575_PRE_RESET_PACKETS;
+      self->pkt_array_len = G_N_ELEMENTS (EGIS0575_PRE_RESET_PACKETS);
+      self->current_index = 0;
+      child_ssm = fpi_ssm_new (FP_DEVICE (dev), packet_ssm_run_state, PACKET_SSM_DONE);
+      fpi_ssm_start_subsm (ssm, child_ssm);
+      break;
+
+    case SSM_SETUP_SOFT_RESET_REQ:
+      transfer = fpi_usb_transfer_new (dev);
+
+      fpi_usb_transfer_fill_bulk_full (transfer, EGIS0575_EPOUT, (unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x60, 0x00}, 6, NULL);
+
+      transfer->ssm = ssm;
+      transfer->short_is_error = TRUE;
+
+      fpi_usb_transfer_submit (transfer, EGIS0575_TIMEOUT, NULL, fpi_ssm_usb_transfer_cb, NULL);
+      break;
+
+    case SSM_SETUP_SOFT_RESET_RESP:
+      transfer = fpi_usb_transfer_new (dev);
+
+      fpi_usb_transfer_fill_bulk (transfer, EGIS0575_EPIN, 7);
+
+      transfer->ssm = ssm;
+      transfer->short_is_error = TRUE;
+
+      fpi_usb_transfer_submit (transfer, EGIS0575_TIMEOUT, NULL, resp_setup, NULL);
       break;
 
     case SSM_PRE_CALIBRATION_BYTES_PHASE_1:
@@ -996,6 +1048,8 @@ dev_init_done (FpiSsm *ssm, FpDevice *dev, GError *error)
   FpImageDevice *img_dev = FP_IMAGE_DEVICE (dev);
 
   fp_dbg ("EGIS INIT DONE");
+  if (error)
+    g_usb_device_release_interface (fpi_device_get_usb_device (dev), 0, 0, NULL);
   fpi_image_device_open_complete (img_dev, error);
 }
 
@@ -1009,6 +1063,8 @@ dev_setup_done (FpiSsm *ssm, FpDevice *dev, GError *error)
       fp_dbg ("Error occurred in setup phase");
       g_clear_pointer (&self->calibration_sequence, g_free);
 
+      // release the interface again, otherwise nobody can open the device until this process exits
+      g_usb_device_release_interface (fpi_device_get_usb_device (dev), 0, 0, NULL);
       fpi_image_device_open_complete (FP_IMAGE_DEVICE (dev), error);
       return;
     }
@@ -1026,7 +1082,11 @@ dev_init (FpImageDevice *dev)
   fp_dbg ("EGIS INIT");
   GError *error = NULL;
 
-  g_usb_device_claim_interface (fpi_device_get_usb_device (FP_DEVICE (dev)), 0, 0, &error);
+  if (!g_usb_device_claim_interface (fpi_device_get_usb_device (FP_DEVICE (dev)), 0, 0, &error))
+    {
+      fpi_image_device_open_complete (dev, error);
+      return;
+    }
 
   FpiSsm *setup_ssm = fpi_ssm_new (FP_DEVICE (dev), setup_ssm_run_state, SSM_SETUP_DONE);
 
