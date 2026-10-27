@@ -25,6 +25,8 @@
 
 #define FP_COMPONENT "egis0575"
 
+#include <math.h>
+
 #include "egis0575.h"
 #include "drivers_api.h"
 
@@ -44,6 +46,7 @@ struct _FpDeviceEgis0575
   gsize           strips_len;
 
   unsigned char * calibration_sequence;
+  int             calibration_retries;
 
   const Packet   *pkt_array;
   int             pkt_array_len;
@@ -153,6 +156,185 @@ finger_present (FpiUsbTransfer *transfer)
   return variance > EGIS0575_MIN_SD && variance < EGIS0575_MAX_SD;
 }
 
+/* Only the central rows of each strip end up in the image: the rows at the
+ * border of the sensor have a lot less contrast. */
+#define EGIS0575_BLIT_FIRST_ROW 10
+#define EGIS0575_BLIT_ROWS 30
+
+static unsigned char
+egis_get_blit_pixel (struct fpi_frame_asmbl_ctx *ctx, struct fpi_frame *frame, unsigned int x, unsigned int y)
+{
+  return frame->data[x + (y + EGIS0575_BLIT_FIRST_ROW) * ctx->frame_width];
+}
+
+static struct fpi_frame_asmbl_ctx blit_ctx = {
+  .frame_width = EGIS0575_IMGWIDTH,
+  .frame_height = EGIS0575_BLIT_ROWS,
+  .image_width = (EGIS0575_IMGWIDTH / 3) * 4,
+  .get_pixel = egis_get_blit_pixel,
+};
+
+/*
+ * Movement estimation
+ *
+ * The generic fpi_do_movement_estimation() does not work well for this sensor:
+ * every frame has a strong brightness gradient (bright center, dark borders)
+ * and some fixed pattern lines, which dominate the pixel differences and make
+ * the estimated offsets jump between the limits of the search range.
+ * So frames are high-pass filtered first and compared using the normalized
+ * cross correlation, which only looks at the ridge structure.
+ */
+#define EGIS0575_HP_RADIUS 5
+#define EGIS0575_MIN_OVERLAP 10
+#define EGIS0575_MAX_DX 8
+#define EGIS0575_MIN_CORRELATION 0.3
+
+static float *
+highpass_frame (struct fpi_frame *frame)
+{
+  const int w = assembling_ctx.frame_width, h = assembling_ctx.frame_height;
+  const int r = EGIS0575_HP_RADIUS;
+  g_autofree double *integral = g_new0 (double, (w + 1) * (h + 1));
+  float *out = g_new (float, w * h);
+
+  for (int y = 0; y < h; y++)
+    for (int x = 0; x < w; x++)
+      integral[(y + 1) * (w + 1) + x + 1] = frame->data[y * w + x] +
+                                            integral[y * (w + 1) + x + 1] +
+                                            integral[(y + 1) * (w + 1) + x] -
+                                            integral[y * (w + 1) + x];
+
+  for (int y = 0; y < h; y++)
+    for (int x = 0; x < w; x++)
+      {
+        int x0 = MAX (x - r, 0), x1 = MIN (x + r + 1, w);
+        int y0 = MAX (y - r, 0), y1 = MIN (y + r + 1, h);
+        double sum = integral[y1 * (w + 1) + x1] - integral[y0 * (w + 1) + x1] -
+                     integral[y1 * (w + 1) + x0] + integral[y0 * (w + 1) + x0];
+
+        out[y * w + x] = frame->data[y * w + x] - sum / ((x1 - x0) * (y1 - y0));
+      }
+
+  return out;
+}
+
+/* Correlation of cur[y][x] with prev[y + dy][x + dx] over the overlapping area */
+static double
+correlation (const float *prev, const float *cur, int dx, int dy)
+{
+  const int w = assembling_ctx.frame_width, h = assembling_ctx.frame_height;
+  double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0, n, cov, va, vb;
+
+  for (int y = MAX (0, -dy); y < MIN (h, h - dy); y++)
+    for (int x = MAX (0, -dx); x < MIN (w, w - dx); x++)
+      {
+        double a = prev[(y + dy) * w + x + dx], b = cur[y * w + x];
+        sa += a;
+        sb += b;
+        saa += a * a;
+        sbb += b * b;
+        sab += a * b;
+      }
+
+  n = (double) (h - ABS (dy)) * (w - ABS (dx));
+  cov = sab - sa * sb / n;
+  va = saa - sa * sa / n;
+  vb = sbb - sb * sb / n;
+  if (va <= 0 || vb <= 0)
+    return 0;
+  return cov / sqrt (va * vb);
+}
+
+/* direction: 0 = search both directions, otherwise only dy with that sign (or 0) */
+static double
+find_offset (const float *prev, const float *cur, int direction, int *dx_out, int *dy_out)
+{
+  const int max_dy = assembling_ctx.frame_height - EGIS0575_MIN_OVERLAP;
+  double best = -2;
+
+  for (int dy = direction > 0 ? 0 : -max_dy; dy <= (direction < 0 ? 0 : max_dy); dy++)
+    for (int dx = -EGIS0575_MAX_DX; dx <= EGIS0575_MAX_DX; dx++)
+      {
+        double c = correlation (prev, cur, dx, dy);
+        if (c > best)
+          {
+            best = c;
+            *dx_out = dx;
+            *dy_out = dy;
+          }
+      }
+
+  return best;
+}
+
+/* Replaces the frame with its high-pass filtered version, scaled to a fixed
+ * contrast, so the strips have no brightness steps in the assembled image */
+static void
+normalize_frame (struct fpi_frame *frame, const float *filtered)
+{
+  const int size = assembling_ctx.frame_width * assembling_ctx.frame_height;
+  double rms = 0;
+
+  for (int i = 0; i < size; i++)
+    rms += filtered[i] * filtered[i];
+  rms = sqrt (rms / size) + 1e-6;
+
+  for (int i = 0; i < size; i++)
+    frame->data[i] = CLAMP (128 + 40 * filtered[i] / rms, 0, 255);
+}
+
+/* Estimates the movement between the strips and drops strips that can not be
+ * matched reliably. Returns the new list of strips. */
+static GSList *
+movement_estimation (GSList *strips)
+{
+  g_autoptr(GPtrArray) filtered = g_ptr_array_new_with_free_func (g_free);
+  double weighted_dy = 0;
+  int direction, dx, dy;
+  GSList *l, *kept;
+  float *prev;
+
+  for (l = strips; l != NULL; l = l->next)
+    g_ptr_array_add (filtered, highpass_frame (l->data));
+
+  /* First pass: find the swipe direction from the confident neighbour pairs */
+  for (guint i = 1; i < filtered->len; i++)
+    {
+      double c = find_offset (filtered->pdata[i - 1], filtered->pdata[i], 0, &dx, &dy);
+      if (c >= EGIS0575_MIN_CORRELATION)
+        weighted_dy += c * dy;
+    }
+  direction = weighted_dy < 0 ? -1 : 1;
+
+  /* Second pass: offsets in swipe direction only, compared to the last kept strip */
+  kept = g_slist_prepend (NULL, strips->data);
+  prev = filtered->pdata[0];
+  normalize_frame (strips->data, prev);
+  for (l = strips->next, dy = 1; l != NULL; l = l->next, dy++)
+    {
+      struct fpi_frame *frame = l->data;
+      float *cur = filtered->pdata[dy];
+      int fdx = 0, fdy = 0;
+      double c = find_offset (prev, cur, direction, &fdx, &fdy);
+
+      fp_dbg ("strip offset dy=%d dx=%d correlation %.2f", fdy, fdx, c);
+      if (c < EGIS0575_MIN_CORRELATION)
+        {
+          g_free (frame);
+          continue;
+        }
+
+      frame->delta_x = fdx;
+      frame->delta_y = fdy;
+      normalize_frame (frame, cur);
+      kept = g_slist_prepend (kept, frame);
+      prev = cur;
+    }
+
+  g_slist_free (strips);
+  return g_slist_reverse (kept);
+}
+
 /* function borrowed from elan.c driver "elan_process_frame_linear" to make the stitching easier */
 static void
 process_frame_linear (unsigned char *raw_frame, GSList ** frames)
@@ -200,9 +382,25 @@ process_imgs (FpiSsm *ssm, FpDevice *dev)
         {
           g_autoptr(FpImage) img = NULL;
           self->strips = g_slist_reverse (self->strips);
-          fpi_do_movement_estimation (&assembling_ctx, self->strips);
 
-          img = fpi_assemble_frames (&assembling_ctx, self->strips);
+          /* Debugging aid: dump the raw strips of every swipe to $EGIS0575_DUMP_DIR */
+          const char *dump_dir = g_getenv ("EGIS0575_DUMP_DIR");
+          if (dump_dir)
+            {
+              gsize frame_size = assembling_ctx.frame_width * assembling_ctx.frame_height;
+              g_autofree char *path = g_strdup_printf ("%s/swipe-%" G_GINT64_FORMAT ".raw", dump_dir, g_get_real_time ());
+              g_autoptr(GByteArray) data = g_byte_array_new ();
+
+              for (GSList *l = self->strips; l != NULL; l = l->next)
+                g_byte_array_append (data, ((struct fpi_frame *) l->data)->data, frame_size);
+              if (g_file_set_contents (path, (char *) data->data, data->len, NULL))
+                fp_dbg ("Dumped %u strips to %s", (guint) self->strips_len, path);
+            }
+
+          self->strips = movement_estimation (self->strips);
+          self->strips_len = g_slist_length (self->strips);
+
+          img = fpi_assemble_frames (&blit_ctx, self->strips);
           img->flags |= (FPI_IMAGE_COLORS_INVERTED | FPI_IMAGE_PARTIAL);
 
           FpImage *resizedImage = fpi_image_resize (img, EGIS0575_RESIZE, EGIS0575_RESIZE);
@@ -314,6 +512,12 @@ resp_image (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError 
       if(self->img_without_finger_in_row > EGIS0575_MAX_CAPTURES_WITHOUT_FINGER_IN_ROW)
         {
           fp_dbg ("To many images without Finger.");
+          // Short swipe -> enough frames anyway, process them instead of throwing them away
+          if(self->strips_len >= EGIS0575_MIN_CAPTURES)
+            {
+              fpi_ssm_jump_to_state (transfer->ssm, IMG_SSM_POST_REPEAT);
+              return;
+            }
           if(self->img_without_finger_in_row == EGIS0575_MAX_CAPTURES_WITHOUT_FINGER_IN_ROW + 1) // dont spam that
             fpi_image_device_report_finger_status (img_self, FALSE);
           g_slist_free_full (self->strips, g_free);
@@ -551,10 +755,19 @@ setup_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
           fp_dbg ("Setup calibration package is broken, please retry");
           g_clear_pointer (&self->calibration_sequence, g_free);
 
+          // The sensor often isn't ready right after the previous session closed, so just run the setup again
+          if (self->calibration_retries++ < EGIS0575_CALIBRATION_RETRIES)
+            {
+              fpi_ssm_jump_to_state_delayed (ssm, SSM_SETUP_START, EGIS0575_CALIBRATION_RETRY_DELAY);
+              return;
+            }
+          self->calibration_retries = 0;
+
           fpi_ssm_mark_failed (ssm, g_error_new_literal (G_IO_ERROR, G_IO_ERROR_CANCELLED, "Setup calibration package broken, retry later"));
           return;
         }
 
+      self->calibration_retries = 0;
       fpi_ssm_mark_completed (ssm);
       break;
     }
@@ -749,6 +962,8 @@ img_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
     case IMG_SSM_PROCESS_DATA:
       if(self->strips_len != 0) // if nothing in buffer do not process imges
         process_imgs (ssm, dev);
+      g_slist_free_full (g_steal_pointer (&self->strips), g_free);
+      self->strips_len = 0;
       fpi_ssm_jump_to_state (ssm, IMG_SSM_FINGER_REQ);
       break;
 
@@ -890,6 +1105,7 @@ fpi_device_egis0575_class_init (FpDeviceEgis0575Class *klass)
   dev_class->type = FP_DEVICE_TYPE_USB;
   dev_class->id_table = id_table;
   dev_class->scan_type = FP_SCAN_TYPE_SWIPE;
+  dev_class->nr_enroll_stages = 8;       /* small sensor, more swipes cover more of the finger */
 
   img_class->img_open = dev_init;
   img_class->img_close = dev_deinit;

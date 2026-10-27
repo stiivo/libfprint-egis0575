@@ -42,7 +42,7 @@
 #define EGIS0575_BZ3_THRESHOLD 15
 #define EGIS0575_RFMGHEIGHT 45 // how much we cut from the top and bottom
 #define EGIS0575_RFMDIS (EGIS0575_IMGHEIGHT - EGIS0575_RFMGHEIGHT) / 2
-#define EGIS0575_RESIZE 1
+#define EGIS0575_RESIZE 2 // ridges are only ~6px apart, NBIS expects ~500dpi
 
 /* MIN SD not the standard deviation anymore, other algorithm produced better distinction for me. without finger 25 to 125, with finger 100 to 300*/
 #define EGIS0575_MIN_SD 100
@@ -51,11 +51,18 @@
 #define EGIS0575_TIMEOUT 10000
 
 // with 10 frames it takes a really long swipe to get an image
-#define EGIS0575_CONSECUTIVE_CAPTURES 10 // how many frames get captured
-#define EGIS0575_CAPTURE_DELAY 50 // how long to wait between each capture
+#define EGIS0575_CONSECUTIVE_CAPTURES 30 // how many frames get captured
+#define EGIS0575_CAPTURE_DELAY 1 // how long to wait between each capture
+
+// when the finger leaves the sensor early, frames are still processed if at least this many were captured
+#define EGIS0575_MIN_CAPTURES 6
 
 // some frames can be dissmissed as not a finger, if more then 5 are dissmissed, we clear the frame buffer.
 #define EGIS0575_MAX_CAPTURES_WITHOUT_FINGER_IN_ROW 5
+
+// a broken calibration sequence is fetched again this many times before giving up
+#define EGIS0575_CALIBRATION_RETRIES 20
+#define EGIS0575_CALIBRATION_RETRY_DELAY 300
 
 /*
  * Image polling sequences
